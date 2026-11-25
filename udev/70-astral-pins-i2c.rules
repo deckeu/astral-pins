@@ -1,0 +1,4 @@
+# astral-pins: give the logged-in desktop user access to the NVIDIA driver's
+# I2C buses (/dev/i2c-N), where the ROG Astral per-pin current sensor lives.
+# Not needed if OpenRGB/ddcutil udev rules already grant access.
+SUBSYSTEM=="i2c-dev", ATTR{name}=="NVIDIA i2c adapter*", TAG+="uaccess"

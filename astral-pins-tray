@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""Tray icon + readout popup for the astral-pins watchdog (KDE/any SNI tray).
+
+Reads the state files the watchdog publishes in $XDG_RUNTIME_DIR:
+  astral-pins.json  ROG Astral onboard per-pin sensor (GPU side)
+  wireview.json     Thermal Grizzly WireView Pro II (inline, USB) - optional
+It never touches the hardware itself. Left-click the icon to pop the readout up
+next to it (a layer-shell surface, so it can be placed at the icon on Wayland);
+click elsewhere, press Esc, or click the icon again to close it.
+"""
+import json, math, os, sys, time
+from collections import deque
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, GtkLayerShell, Pango, PangoCairo  # noqa: E402
+import cairo  # noqa: E402
+
+RUN_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+STATE_FILE = os.path.join(RUN_DIR, "astral-pins.json")
+WV_STATE_FILE = os.path.join(RUN_DIR, "wireview.json")
+WV_CMD_FILE = os.path.join(RUN_DIR, "wireview.cmd")   # requests to the watchdog
+WV_SCREENS = ["main", "simple", "current", "temp", "status"]
+
+
+def request_wv_screen(name):
+    tmp = WV_CMD_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"screen": name, "ts": time.time()}, f)
+        os.replace(tmp, WV_CMD_FILE)
+    except OSError as e:
+        log(f"screen request failed: {e}")
+STALE_S = 5
+SCALE_A = 10.0          # full-scale of the pin bars
+HISTORY_S = 120
+__version__ = "1.0.0"
+
+GREEN, AMBER, RED, GREY = (0.30, 0.80, 0.40), (1.0, 0.70, 0.15), (0.95, 0.25, 0.25), (0.45, 0.45, 0.45)
+BG, PANEL, FG, DIM = (0.08, 0.09, 0.10), (0.14, 0.15, 0.17), (0.93, 0.94, 0.95), (0.55, 0.58, 0.62)
+
+SNI_XML = """
+<node><interface name="org.kde.StatusNotifierItem">
+  <property name="Category" type="s" access="read"/>
+  <property name="Id" type="s" access="read"/>
+  <property name="Title" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/>
+  <property name="WindowId" type="i" access="read"/>
+  <property name="IconName" type="s" access="read"/>
+  <property name="IconPixmap" type="a(iiay)" access="read"/>
+  <property name="AttentionIconName" type="s" access="read"/>
+  <property name="AttentionIconPixmap" type="a(iiay)" access="read"/>
+  <property name="OverlayIconName" type="s" access="read"/>
+  <property name="OverlayIconPixmap" type="a(iiay)" access="read"/>
+  <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+  <property name="ItemIsMenu" type="b" access="read"/>
+  <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+  <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+  <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+  <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+  <signal name="NewTitle"/><signal name="NewIcon"/><signal name="NewAttentionIcon"/>
+  <signal name="NewOverlayIcon"/><signal name="NewToolTip"/>
+  <signal name="NewStatus"><arg name="status" type="s"/></signal>
+</interface></node>"""
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def pin_color(a, warn, limit):
+    return RED if a >= limit else AMBER if a >= warn else GREEN
+
+
+def read_state(path):
+    """Fresh state dict (may hold just 'error'), or None if missing/stale."""
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if time.time() - st.get("ts", 0) > STALE_S:
+        return None
+    return st
+
+
+def has_data(st):
+    return bool(st and "pins" in st)
+
+
+# ---------------------------------------------------------------- sources ---
+class Source:
+    """One measuring device: latest state + peaks + history for the popup."""
+
+    def __init__(self, key, path):
+        self.key, self.path = key, path
+        self.st = None
+        self.seen = False
+        self.peaks = [0.0] * 6
+        self.history = deque(maxlen=HISTORY_S)
+        self.pin_hist = deque(maxlen=HISTORY_S)
+
+    def refresh(self):
+        self.st = read_state(self.path)
+        if has_data(self.st):
+            self.seen = True
+            amps = [a for *_, a in self.st["pins"]]
+            self.peaks = [max(p, a) for p, a in zip(self.peaks, amps)]
+            self.history.append(self.total_w())
+            self.pin_hist.append(amps)
+
+    def reset_peaks(self):
+        self.peaks = [a for *_, a in self.st["pins"]] if has_data(self.st) else [0.0] * 6
+
+    def level(self):
+        return self.st.get("level", 0) if has_data(self.st) else 0
+
+    def total_w(self):
+        st = self.st
+        if "total_w" in st:
+            return st["total_w"]
+        return sum(v * a for _, v, a in st["pins"])
+
+    def total_a(self):
+        st = self.st
+        return st.get("total_a", sum(a for *_, a in st["pins"]))
+
+    # text shown on the card
+    def title(self):
+        if self.key == "astral":
+            return "ROG Astral  ·  GPU-side sensor"
+        st = self.st or {}
+        fw = f"  ·  fw {st['fw']}" if "fw" in st else ""
+        return f"{st.get('model', 'WireView Pro II')}{fw}  ·  inline"
+
+    def no_data_msg(self):
+        if self.key == "astral":
+            return "No data", "Is astral-pins.service running?"
+        err = (self.st or {}).get("error", "no data")
+        return "WireView not available", err[:60]
+
+
+# ------------------------------------------------------------------ icon ----
+def render_icon(size, st, level=0):
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surf)
+    r = size * 0.18
+    cr.new_sub_path()
+    for cx, cy, a0 in ((size - r, r, -90), (size - r, size - r, 0), (r, size - r, 90), (r, r, 180)):
+        cr.arc(cx, cy, r, math.radians(a0), math.radians(a0 + 90))
+    cr.close_path()
+    cr.set_source_rgb(*BG)
+    cr.fill_preserve()
+    if level:
+        cr.set_source_rgb(*(RED if level == 2 else AMBER))
+        cr.set_line_width(max(1.5, size / 12))
+        cr.stroke()
+    else:
+        cr.new_path()
+    pad, gap = size * 0.14, size * 0.06
+    bw = (size - 2 * pad - 5 * gap) / 6
+    h = size - 2 * pad
+    for i in range(6):
+        x = pad + i * (bw + gap)
+        if has_data(st):
+            a = st["pins"][i][2]
+            frac = max(0.06, min(1.0, a / SCALE_A))
+            cr.set_source_rgb(*pin_color(a, st["warn_a"], st["limit_a"]))
+        else:
+            frac = 0.06
+            cr.set_source_rgb(*GREY)
+        cr.rectangle(x, pad + h * (1 - frac), bw, h * frac)
+        cr.fill()
+    surf.flush()
+    bgra = bytes(surf.get_data())
+    argb = bytearray(len(bgra))  # cairo is native-endian BGRA; SNI wants ARGB
+    argb[0::4], argb[1::4], argb[2::4], argb[3::4] = bgra[3::4], bgra[2::4], bgra[1::4], bgra[0::4]
+    return (size, size, bytes(argb))
+
+
+# ---------------------------------------------------------------- readout ---
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                      "astral-pins", "tray.json")
+
+
+def load_cfg():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cfg(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w") as f:
+            json.dump(cfg, f)
+    except OSError:
+        pass
+
+
+class Readout(Gtk.Window):
+    CW, BASE_H, EXTRA_H = 400, 380, 236   # card width, base height, pin-graph section
+    RADIUS = 12
+    GAP = 14             # distance from the click point / panel
+
+    @property
+    def H(self):
+        return self.BASE_H + (self.EXTRA_H if self.expanded else 0)
+
+    @property
+    def W(self):
+        return self.CW * len(self.cards())
+
+    def __init__(self, app, sources):
+        super().__init__(application=app, title="12V-2x6 Readout")
+        self.sources = sources
+        self.cfg = load_cfg()
+        self.expanded = bool(self.cfg.get("pin_graphs", False))
+        self.rects = []           # clickable areas: (x, y, w, h, callback)
+        self.last_xy = (0, 0)
+        self.hidden_at = 0.0
+        self.ncards = len(self.cards())
+        self.set_size_request(self.W, self.H)
+        self.set_resizable(False)
+        self.set_decorated(False)
+        self.set_app_paintable(True)
+        vis = self.get_screen().get_rgba_visual()
+        if vis:
+            self.set_visual(vis)
+
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_namespace(self, "astral-pins")
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_exclusive_zone(self, -1)  # position relative to the real screen edge
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP, True)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.LEFT, True)
+
+        self.area = Gtk.DrawingArea()
+        self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.area.connect("draw", lambda w, cr: self.draw(
+            cr, w.get_allocated_width(), w.get_allocated_height()))
+        self.area.connect("button-press-event", self.on_press)
+        self.add(self.area)
+        self.connect("focus-out-event", lambda *_: self.dismiss("focus-out"))
+        self.connect("key-press-event", self.on_key)
+        self.connect("delete-event", lambda *_: (self.dismiss("delete"), True)[1])
+
+    def cards(self):
+        """Astral always; WireView once it has delivered data this session."""
+        return [s for s in self.sources if s.key == "astral" or s.seen]
+
+    # --- show / hide -----------------------------------------------------
+    def popup_at(self, x, y):
+        disp = Gdk.Display.get_default()
+        mon = disp.get_monitor_at_point(x, y) if (x or y) else disp.get_primary_monitor() \
+            or disp.get_monitor(0)
+        g = mon.get_geometry()
+        if not (x or y):                     # tray gave no position: bottom-right corner
+            x, y = g.x + g.width - 1, g.y + g.height - 1
+        lx, ly = x - g.x, y - g.y
+        W, H = self.W, self.H
+        left = min(max(lx - W // 2, 8), g.width - W - 8)
+        if ly > g.height / 2:                # panel at the bottom -> open upwards
+            top = ly - H - self.GAP
+        else:
+            top = ly + self.GAP
+        top = min(max(top, 8), g.height - H - 8)
+        self.last_xy = (x, y)
+        if not self.get_visible():           # monitor can't change while mapped
+            GtkLayerShell.set_monitor(self, mon)
+        self.set_size_request(W, H)
+        self.resize(W, H)
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.LEFT, int(left))
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.TOP, int(top))
+        log(f"popup at click ({x},{y}) monitor {mon.get_model()} -> margin ({left},{top})"
+            f" size {W}x{H}")
+        self.show_all()
+        self.present()
+
+    def dismiss(self, why=""):
+        if self.get_visible():
+            self.hide()
+            self.hidden_at = time.monotonic()
+            log(f"hidden ({why})")
+        return False
+
+    def on_key(self, w, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            self.dismiss("esc")
+        return False
+
+    def on_press(self, w, ev):
+        for x, y, rw, rh, cb in self.rects:
+            if x <= ev.x <= x + rw and y <= ev.y <= y + rh:
+                cb()
+                break
+        return True
+
+    def toggle_graphs(self):
+        self.expanded = not self.expanded
+        self.cfg["pin_graphs"] = self.expanded
+        save_cfg(self.cfg)
+        self.popup_at(*self.last_xy)         # resize + keep it attached to the icon
+        self.area.queue_draw()
+
+    def next_wv_screen(self):
+        """Cycle the WireView display: main → simple → current → temp → status → main."""
+        cur = self.cfg.get("wv_screen")
+        nxt = WV_SCREENS[(WV_SCREENS.index(cur) + 1) % len(WV_SCREENS)] if cur in WV_SCREENS \
+            else WV_SCREENS[0]
+        request_wv_screen(nxt)
+        self.cfg["wv_screen"] = nxt
+        save_cfg(self.cfg)
+        log(f"requested WireView screen {nxt}")
+        self.area.queue_draw()
+
+    def refreshed(self):
+        """Called after sources refreshed; resize if a card appeared."""
+        n = len(self.cards())
+        if n != self.ncards:
+            self.ncards = n
+            if self.get_visible():
+                self.popup_at(*self.last_xy)
+        if self.get_visible():
+            self.area.queue_draw()
+
+    # --- drawing -----------------------------------------------------------
+    def text(self, cr, x, y, s, size=10, color=FG, bold=False, mono=False, align="l"):
+        lay = PangoCairo.create_layout(cr)
+        fd = Pango.FontDescription(f"{'Monospace' if mono else 'Sans'} {'Bold ' if bold else ''}{size}")
+        lay.set_font_description(fd)
+        lay.set_text(s, -1)
+        w, h = lay.get_pixel_size()
+        cr.move_to(x - (w if align == "r" else w / 2 if align == "c" else 0), y)
+        cr.set_source_rgb(*color)
+        PangoCairo.show_layout(cr, lay)
+        return w, h
+
+    def draw(self, cr, w, h):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        r = self.RADIUS
+        cr.new_sub_path()
+        for cx, cy, a0 in ((w - r, r, -90), (w - r, h - r, 0), (r, h - r, 90), (r, r, 180)):
+            cr.arc(cx, cy, r, math.radians(a0), math.radians(a0 + 90))
+        cr.close_path()
+        cr.set_source_rgba(*BG, 0.97)
+        cr.fill_preserve()
+        cr.set_source_rgba(1, 1, 1, 0.12)
+        cr.set_line_width(1)
+        cr.stroke()
+        self.rects = []
+        for i, src in enumerate(self.cards()):
+            x0 = i * self.CW
+            if i:
+                cr.set_source_rgba(1, 1, 1, 0.10)
+                cr.rectangle(x0, 12, 1, h - 24); cr.fill()
+            cr.save()
+            cr.translate(x0, 0)
+            self.draw_card(cr, src, self.CW, h, x0, first=(i == 0))
+            cr.restore()
+
+    def link(self, cr, x0, x, y, s, cb, color=DIM, align="l"):
+        tw, th = self.text(cr, x, y, s, 9, color, align=align)
+        lx = x - tw if align == "r" else x
+        self.rects.append((x0 + lx - 6, y - 4, tw + 12, th + 8, cb))
+
+    def draw_card(self, cr, src, w, h, x0, first):
+        st, hb = src.st, self.BASE_H
+        if first:
+            self.link(cr, x0, 16, hb - 24, ("▾" if self.expanded else "▸") + " pin graphs",
+                      self.toggle_graphs, FG if self.expanded else DIM)
+        if not has_data(st):
+            big, small = src.no_data_msg()
+            self.text(cr, w / 2, hb / 2 - 30, big, 15, DIM, True, align="c")
+            self.text(cr, w / 2, hb / 2 - 2, small, 9, DIM, align="c")
+            return
+        pins, warn, limit = st["pins"], st["warn_a"], st["limit_a"]
+        amps = [a for *_, a in pins]
+        volts = [v for _, v, _ in pins]
+        lvl = st.get("level", 0)
+        faults = st.get("faults", [])
+
+        # header
+        self.text(cr, 16, 10, src.title(), 9, DIM)
+        self.text(cr, 16, 26, f"{src.total_w():5.0f}", 30, FG, True, mono=True)
+        self.text(cr, 150, 46, "W", 14, DIM, True)
+        self.text(cr, w - 16, 28, f"{src.total_a():5.2f} A", 14, FG, True, mono=True, align="r")
+        chip, col = (("CRITICAL", RED) if lvl == 2 else ("WARNING", AMBER) if lvl == 1
+                     else ("FAULT", AMBER) if faults else ("OK", GREEN))
+        self.text(cr, w - 16, 52, chip, 10, col, True, align="r")
+
+        # pin rows
+        top, rh = 84, 30
+        bx, bw = 46, w - 46 - 150
+        for i, (p, v, a) in enumerate(pins):
+            y = top + i * rh
+            self.text(cr, 16, y + 3, f"P{p}", 10, DIM, True)
+            cr.set_source_rgb(*PANEL)
+            cr.rectangle(bx, y + 4, bw, 14); cr.fill()
+            cr.set_source_rgb(*pin_color(a, warn, limit))
+            cr.rectangle(bx, y + 4, bw * min(1, a / SCALE_A), 14); cr.fill()
+            for mark, mc in ((warn, AMBER), (limit, RED)):
+                mx = bx + bw * mark / SCALE_A
+                cr.set_source_rgba(*mc, 0.7); cr.rectangle(mx, y + 2, 1.2, 18); cr.fill()
+            pk = bx + bw * min(1, src.peaks[i] / SCALE_A)
+            cr.set_source_rgb(*FG); cr.rectangle(pk - 1, y + 4, 2, 14); cr.fill()
+            self.text(cr, w - 92, y + 2, f"{a:5.2f}A", 11, FG, True, mono=True, align="r")
+            self.text(cr, w - 16, y + 3, f"{v:6.3f}V", 9, DIM, mono=True, align="r")
+
+        # stats
+        y = top + 6 * rh + 4
+        spread = max(amps) - min(amps)
+        self.text(cr, 16, y, f"spread {spread:4.2f} A", 9, AMBER if spread >= 3 else DIM, mono=True)
+        self.text(cr, w / 2, y, f"peak {max(src.peaks):4.2f} A", 9, DIM, mono=True, align="c")
+        self.text(cr, w - 16, y, f"min {min(volts):6.3f} V", 9, DIM, mono=True, align="r")
+
+        # device info line
+        y2 = y + 18
+        if src.key == "wireview":
+            temps = "  ".join(f"{lbl} {t:.1f}°" if t is not None else f"{lbl} –"
+                              for lbl, t in st.get("temps", []))
+            self.text(cr, 16, y2, temps, 8, DIM, mono=True)
+            extra = f"PSU {st['psu_cap_w']} W" if st.get("psu_cap_w") else ""
+            if faults:
+                self.text(cr, w - 16, y2, "fault: " + ", ".join(faults), 8, AMBER, align="r")
+            elif extra:
+                self.text(cr, w - 16, y2, extra, 8, DIM, mono=True, align="r")
+        else:
+            self.text(cr, 16, y2, f"onboard IT8915FN  ·  i2c-{st.get('bus', '?')}  ·  0x2B",
+                      8, DIM, mono=True)
+
+        # power history sparkline
+        gy = y2 + 22
+        gh = hb - gy - 30
+        self.link(cr, x0, w - 16, hb - 24, "↺ reset peaks", src.reset_peaks, align="r")
+        if src.key == "wireview":
+            cur = self.cfg.get("wv_screen")
+            label = f"▣ screen: {cur.capitalize()} ›" if cur else "▣ change screen ›"
+            self.link(cr, x0, w / 2 - 40, hb - 24, label, self.next_wv_screen,
+                      FG if cur else DIM)
+        cr.set_source_rgb(*PANEL); cr.rectangle(16, gy, w - 32, gh); cr.fill()
+        if len(src.history) > 1:
+            hi = max(max(src.history), 50)
+            n = src.history.maxlen
+            cr.set_source_rgb(*GREEN); cr.set_line_width(1.5)
+            for k, val in enumerate(src.history):
+                x = 16 + (w - 32) * (n - len(src.history) + k) / (n - 1)
+                yy = gy + gh - 3 - (gh - 6) * val / hi
+                (cr.move_to if k == 0 else cr.line_to)(x, yy)
+            cr.stroke()
+            self.text(cr, 20, gy + 2, f"{hi:.0f} W", 7, DIM)
+            self.text(cr, w - 20, gy + gh - 14, f"{HISTORY_S}s", 7, DIM, align="r")
+
+        if self.expanded:
+            self.draw_pin_graphs(cr, src, w, hb, warn, limit)
+
+    def draw_pin_graphs(self, cr, src, w, y0, warn, limit):
+        """2x3 grid of per-pin current history, all on one shared scale."""
+        cr.set_source_rgba(1, 1, 1, 0.10)
+        cr.rectangle(16, y0, w - 32, 1); cr.fill()
+        hist = src.pin_hist
+        labels = [p for p, *_ in src.st["pins"]]
+        n = hist.maxlen
+        hi = max([max(s) for s in hist] + [2.0]) * 1.2
+        hi = min(math.ceil(hi), SCALE_A + 1)
+        col_gap, cw = 12, (w - 32 - 12) / 2
+        ch = (self.EXTRA_H - 16) / 3
+        for i in range(6):
+            cx = 16 + (i % 2) * (cw + col_gap)
+            cy = y0 + 10 + (i // 2) * ch
+            gy, gh = cy + 18, ch - 26
+            cur = hist[-1][i] if hist else 0.0
+            col = pin_color(max((s[i] for s in hist), default=0), warn, limit)
+            self.text(cr, cx, cy, f"P{labels[i]}", 9, DIM, True)
+            self.text(cr, cx + 26, cy - 1, f"{cur:5.2f} A", 10, pin_color(cur, warn, limit),
+                      True, mono=True)
+            self.text(cr, cx + cw, cy + 1, f"pk {src.peaks[i]:4.2f}", 8, DIM, mono=True, align="r")
+            cr.set_source_rgb(*PANEL); cr.rectangle(cx, gy, cw, gh); cr.fill()
+            for mark, mc in ((warn, AMBER), (limit, RED)):
+                if mark <= hi:
+                    my = gy + gh - gh * mark / hi
+                    cr.set_source_rgba(*mc, 0.6); cr.rectangle(cx, my, cw, 1); cr.fill()
+            if len(hist) > 1:
+                pts = [(cx + cw * (n - len(hist) + k) / (n - 1), gy + gh - (gh - 2) * s[i] / hi)
+                       for k, s in enumerate(hist)]
+                cr.move_to(pts[0][0], gy + gh)
+                for px, py in pts:
+                    cr.line_to(px, py)
+                cr.line_to(pts[-1][0], gy + gh); cr.close_path()
+                cr.set_source_rgba(*col, 0.18); cr.fill()
+                for k, (px, py) in enumerate(pts):
+                    (cr.move_to if k == 0 else cr.line_to)(px, py)
+                cr.set_source_rgb(*col); cr.set_line_width(1.4); cr.stroke()
+        self.text(cr, w - 16, y0 + self.EXTRA_H - 14, f"0–{hi:.0f} A · {HISTORY_S}s", 7, DIM,
+                  align="r")
+
+
+# ----------------------------------------------------------------- tray -----
+class Tray:
+    PATH = "/StatusNotifierItem"
+
+    def __init__(self, app):
+        self.app = app
+        self.astral = Source("astral", STATE_FILE)
+        self.wv = Source("wireview", WV_STATE_FILE)
+        self.win = Readout(app, [self.astral, self.wv])
+        self.status = "Active"
+        self.icons = None
+        self.tip = None
+        self.pix_v = self.pixmap_variant([])
+        self.tip_v = GLib.Variant("(sa(iiay)ss)", ("", [], "GPU 12V-2x6", ""))
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        info = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        self.bus.register_object(self.PATH, info, self.on_call, self.on_get, None)
+        Gio.bus_own_name_on_connection(self.bus, self.name, Gio.BusNameOwnerFlags.NONE, None, None)
+        Gio.bus_watch_name_on_connection(self.bus, "org.kde.StatusNotifierWatcher",
+                                         Gio.BusNameWatcherFlags.NONE, self.register, None)
+        self.tick()
+        GLib.timeout_add_seconds(1, self.tick)
+
+    def register(self, *_):
+        self.bus.call("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                      "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+                      GLib.Variant("(s)", (self.name,)), None, Gio.DBusCallFlags.NONE, -1, None, None)
+
+    def level(self):
+        return max(self.astral.level(), self.wv.level())
+
+    def tooltip(self):
+        head = {0: "OK", 1: "WARNING", 2: "CRITICAL"}[self.level()]
+        lines = []
+        for src, name in ((self.astral, "Astral"), (self.wv, "WireView")):
+            if has_data(src.st):
+                amps = [a for *_, a in src.st["pins"]]
+                lines.append(f"{name}: {src.total_w():.0f} W · {src.total_a():.2f} A · "
+                             f"max pin {max(amps):.2f} A · spread {max(amps) - min(amps):.2f} A")
+            elif src.key == "astral" or src.seen:
+                lines.append(f"{name}: no data")
+        return f"GPU 12V-2x6 — {head}", "\n".join(lines)
+
+    STATIC = {
+        "Category": GLib.Variant("s", "Hardware"),
+        "Id": GLib.Variant("s", "astral-pins"),
+        "Title": GLib.Variant("s", "GPU 12V-2x6"),
+        "WindowId": GLib.Variant("i", 0),
+        "IconName": GLib.Variant("s", ""),
+        "AttentionIconName": GLib.Variant("s", ""),
+        "OverlayIconName": GLib.Variant("s", ""),
+        "OverlayIconPixmap": GLib.Variant("a(iiay)", []),
+        "ItemIsMenu": GLib.Variant("b", False),
+    }
+
+    @staticmethod
+    def pixmap_variant(icons):
+        # build 'ay' straight from bytes; GLib.Variant('ay', bytes) goes element by element
+        items = [GLib.Variant.new_tuple(GLib.Variant("i", w), GLib.Variant("i", h),
+                                        GLib.Variant.new_from_bytes(GLib.VariantType("ay"),
+                                                                    GLib.Bytes.new(data), True))
+                 for w, h, data in icons]
+        return GLib.Variant.new_array(GLib.VariantType("(iiay)"), items)
+
+    def on_get(self, conn, sender, path, iface, prop):
+        if prop in ("IconPixmap", "AttentionIconPixmap"):
+            return self.pix_v
+        if prop == "ToolTip":
+            return self.tip_v
+        if prop == "Status":
+            return GLib.Variant("s", self.status)
+        return self.STATIC.get(prop)
+
+    def on_call(self, conn, sender, path, iface, method, params, inv):
+        if method == "Activate":
+            x, y = params.unpack()
+            if self.win.get_visible():
+                self.win.dismiss("icon click")
+            elif time.monotonic() - self.win.hidden_at > 0.4:
+                # (if focus-out just closed it, this same click shouldn't reopen it)
+                self.win.popup_at(x, y)
+        inv.return_value(None)
+
+    def emit(self, sig, params=None):
+        self.bus.emit_signal(None, self.PATH, "org.kde.StatusNotifierItem", sig, params)
+
+    def tick(self):
+        self.astral.refresh()
+        self.wv.refresh()
+        self.win.refreshed()
+        # icon bars follow the GPU-side sensor (WireView if the Astral has no data)
+        icon_src = self.astral.st if has_data(self.astral.st) else self.wv.st
+        lvl = self.level()
+        icons = [render_icon(s, icon_src, lvl) for s in (22, 32, 48, 64)]
+        if icons != self.icons:
+            self.icons = icons
+            self.pix_v = self.pixmap_variant(icons)
+            self.emit("NewIcon"); self.emit("NewAttentionIcon")
+        tip = self.tooltip()
+        if tip != self.tip:
+            self.tip = tip
+            self.tip_v = GLib.Variant("(sa(iiay)ss)", ("", [], *tip))
+            self.emit("NewToolTip")
+        status = "NeedsAttention" if lvl else "Active"
+        if status != self.status:
+            self.status = status
+            self.emit("NewStatus", GLib.Variant("(s)", (status,)))
+        return True
+
+
+def main():
+    app = Gtk.Application(application_id="org.astralpins.Tray")
+    holder = {}
+
+    def activate(a):
+        if "tray" not in holder:
+            a.hold()
+            holder["tray"] = Tray(a)
+    app.connect("activate", activate)
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()

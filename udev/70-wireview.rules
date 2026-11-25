@@ -1,0 +1,7 @@
+# astral-pins: Thermal Grizzly WireView Pro II (STM32 virtual COM port 0483:5740).
+# - gives the logged-in desktop user access to the serial port
+# - stops ModemManager from probing it (the protocol has no framing)
+# - adds a stable /dev/wireview symlink
+# 0483:5740 is a generic STM32 ID; install.sh adds ATTRS{serial}=="..." for your
+# unit when it is plugged in, so other STM32 gadgets are not affected.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1", SYMLINK+="wireview"

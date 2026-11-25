@@ -1,0 +1,12 @@
+[Unit]
+Description=ROG Astral 12V-2x6 per-pin current watchdog
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/astral-pins --watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

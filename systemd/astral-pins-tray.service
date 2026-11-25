@@ -1,0 +1,12 @@
+[Unit]
+Description=ROG Astral 12V-2x6 tray readout
+After=graphical-session.target astral-pins.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/astral-pins-tray
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

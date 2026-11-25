@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""Per-pin 12V-2x6 monitor and watchdog for ASUS ROG Astral RTX 50 cards on Linux,
+with optional Thermal Grizzly WireView Pro II support.
+
+ROG Astral: reads the onboard ITE IT8915FN current sensor (I2C addr 0x2B,
+regs 0x80..0x97) over the NVIDIA driver's I2C buses using SMBus *read*
+transactions only. Layout (community reverse engineering, see vhpwr-guard):
+  6 pins x 4 bytes, big-endian: u16 millivolts, u16 milliamps; block index 0 = pin 5.
+
+Usage:  astral-pins                 # live view, refresh every 1 s
+        astral-pins --once          # single sample
+        astral-pins --watch         # watchdog (what the systemd user service runs)
+        astral-pins --test-alert    # show the alert dialog with fake data (dry run)
+        astral-pins --wv-screen temp  # switch the WireView display (via the watchdog)
+"""
+import argparse, ctypes, fcntl, glob, json, os, struct, subprocess, sys, termios, time
+
+__version__ = "1.0.0"
+
+RUN_DIR = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+STATE_FILE = os.path.join(RUN_DIR, "astral-pins.json")
+WV_STATE_FILE = os.path.join(RUN_DIR, "wireview.json")
+
+
+def write_state(path=STATE_FILE, **kw):
+    """Publish the latest reading for the tray UI (atomic replace)."""
+    kw["ts"] = time.time()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(kw, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------- WireView Pro II --
+# Thermal Grizzly WireView Pro II over USB CDC-ACM (STM32 0483:5740), 115200 8N1.
+# Polled: send one command byte, get a fixed-size little-endian reply, no framing/CRC.
+# Layout from the community wireview-hwmon / wireview-monitor projects.
+# Commands ever sent: 0x01 (vendor/identify), 0x04 (sensor values), and - only on
+# request from the tray - 0x0C screen change with one of the WV_SCREENS codes below.
+WV_CMD_VENDOR, WV_CMD_SENSORS, WV_CMD_SCREEN = 0x01, 0x04, 0x0C
+WV_SCREENS = {"main": 0xE0, "simple": 0xE1, "current": 0xE2, "temp": 0xE3, "status": 0xE4}
+WV_CMD_FILE = os.path.join(RUN_DIR, "wireview.cmd")   # tray -> watchdog requests
+WV_FMT = "<4hHBB" + "hHII" * 6 + "IIHBBHH"      # 100 bytes
+WV_FAULTS = ["chip over-temp", "sensor over-temp", "total over-current",
+             "wire over-current", "over-power", "current imbalance"]
+WV_PSU_CAP = {0: 600, 1: 450, 2: 300, 3: 150}
+WV_TEMP_LABELS = ["In", "Out", "Ext1", "Ext2"]
+
+
+def wireview_paths():
+    return (glob.glob("/dev/wireview") +
+            sorted(glob.glob("/dev/serial/by-id/*STM32_Virtual_ComPort*")))
+
+
+class WireView:
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            a = termios.tcgetattr(self.fd)
+            a[0] = 0                                           # iflag
+            a[1] = 0                                           # oflag
+            a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL  # cflag: 8N1, no flow ctl
+            a[3] = 0                                           # lflag
+            a[4] = a[5] = termios.B115200
+            a[6][termios.VMIN], a[6][termios.VTIME] = 0, 10    # 1 s read timeout
+            termios.tcsetattr(self.fd, termios.TCSANOW, a)
+            fl = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+            time.sleep(0.2)                                    # let the welcome banner arrive
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+            v = self._cmd(WV_CMD_VENDOR, 3)
+            if v[0] != 0xEF or v[1] not in (0x05, 0x06):
+                raise OSError(f"not a WireView Pro II (vendor data {v.hex()})")
+            self.model = "WireView Pro II" + (" Noctua" if v[1] == 0x06 else "")
+            self.fw = v[2]
+        except Exception:
+            os.close(self.fd)
+            raise
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def _cmd(self, cmd, n, timeout=1.5):
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        os.write(self.fd, bytes([cmd]))
+        buf, end = b"", time.monotonic() + timeout
+        while len(buf) < n and time.monotonic() < end:
+            chunk = os.read(self.fd, n - len(buf))
+            if chunk:
+                buf += chunk
+        if len(buf) != n:
+            raise OSError(f"short reply to 0x{cmd:02x}: {len(buf)}/{n} bytes")
+        return buf
+
+    def screen(self, name):
+        code = WV_SCREENS[name]                 # whitelist: KeyError for anything else
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        if os.write(self.fd, bytes([WV_CMD_SCREEN, code])) != 2:
+            raise OSError("short write")
+
+    def read(self):
+        f = struct.unpack(WV_FMT, self._cmd(WV_CMD_SENSORS, 100))
+        ts, vdd, fan, pad1 = f[0:4], f[4], f[5], f[6]
+        raw = [f[7 + 4 * i: 11 + 4 * i] for i in range(6)]    # (mV, pad, mA, mW)
+        tot_p, tot_i, avg_v, cap, pad2, fault, flog = f[31:38]
+        if (fan > 100 or pad1 or pad2 or vdd > 6000 or
+                any(not -1000 <= mv <= 20000 or ma > 60000 for mv, _, ma, _ in raw)):
+            raise OSError("WireView frame failed sanity check")
+        return {
+            "pins": [(i + 1, mv / 1000, ma / 1000) for i, (mv, _, ma, _) in enumerate(raw)],
+            "total_w": tot_p / 1000, "total_a": tot_i / 1000, "avg_v": avg_v / 1000,
+            "temps": [(lbl, t / 10 if -400 <= t <= 2000 else None)
+                      for lbl, t in zip(WV_TEMP_LABELS, ts)],
+            "fan": fan, "psu_cap_w": WV_PSU_CAP.get(cap & 3),
+            "faults": [n for b, n in enumerate(WV_FAULTS) if fault >> b & 1],
+            "fault_log": [n for b, n in enumerate(WV_FAULTS) if flog >> b & 1],
+        }
+
+
+class WireViewPoller:
+    """Keeps a WireView connection alive; never raises into the watchdog loop."""
+    RETRY_S = 10
+
+    def __init__(self):
+        self.dev, self.next_try, self.fails, self.err = None, 0.0, 0, "not connected"
+        self.announced = False
+
+    def handle_requests(self):
+        """Apply a pending tray request (only screen changes are accepted)."""
+        try:
+            with open(WV_CMD_FILE) as f:
+                req = json.load(f)
+            os.unlink(WV_CMD_FILE)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            print(f"WireView: bad request file: {e}", flush=True)
+            try:
+                os.unlink(WV_CMD_FILE)
+            except OSError:
+                pass
+            return
+        name = req.get("screen") if isinstance(req, dict) else None
+        if name not in WV_SCREENS:
+            print(f"WireView: rejected request {req!r}", flush=True)
+            return
+        if time.time() - req.get("ts", 0) > 10:
+            return                                  # stale click, ignore
+        try:
+            self.dev.screen(name)
+            print(f"WireView: screen -> {name}", flush=True)
+        except OSError as e:
+            print(f"WireView: screen change failed: {e}", flush=True)
+
+    def poll(self):
+        if self.dev is None:
+            if time.monotonic() < self.next_try:
+                return None
+            self.next_try = time.monotonic() + self.RETRY_S
+            for p in wireview_paths():
+                try:
+                    self.dev = WireView(p)
+                    print(f"WireView connected: {self.dev.model} fw {self.dev.fw} on {p}",
+                          flush=True)
+                    self.fails = 0
+                    break
+                except OSError as e:
+                    self.err = f"{p}: {e.strerror or e}"
+            else:
+                if not wireview_paths():
+                    self.err = "not connected"
+                if not self.announced:
+                    print(f"WireView unavailable: {self.err}", flush=True)
+                    self.announced = True
+                return None
+        self.handle_requests()
+        try:
+            d = self.dev.read()
+            self.fails, self.announced = 0, False
+            d.update(model=self.dev.model, fw=self.dev.fw)
+            return d
+        except (OSError, struct.error) as e:
+            self.fails += 1
+            self.err = str(e)
+            if self.fails >= 3:
+                print(f"WireView lost: {e}", flush=True)
+                self.dev.close(); self.dev = None
+            return None
+
+ADDR, REG, NPINS = 0x2B, 0x80, 6
+I2C_SLAVE, I2C_SMBUS = 0x0703, 0x0720
+SMBUS_READ, SMBUS_BYTE_DATA = 1, 2
+WARN_A, LIMIT_A = 8.5, 9.5  # 12V-2x6 pins are rated ~9.5 A
+
+
+class SmbusData(ctypes.Union):
+    _fields_ = [("byte", ctypes.c_uint8), ("word", ctypes.c_uint16),
+                ("block", ctypes.c_uint8 * 34)]
+
+
+class SmbusIoctl(ctypes.Structure):
+    _fields_ = [("read_write", ctypes.c_uint8), ("command", ctypes.c_uint8),
+                ("size", ctypes.c_uint32), ("data", ctypes.POINTER(SmbusData))]
+
+
+def read_byte(fd, reg):
+    d = SmbusData()
+    req = SmbusIoctl(SMBUS_READ, reg, SMBUS_BYTE_DATA, ctypes.pointer(d))
+    fcntl.ioctl(fd, I2C_SMBUS, req)
+    return d.byte
+
+
+def nvidia_buses():
+    out = []
+    for p in sorted(glob.glob("/sys/bus/i2c/devices/i2c-*/name")):
+        if "nvidia" in open(p).read().lower():
+            out.append(int(p.split("/")[-2].split("-")[1]))
+    return sorted(out)
+
+
+def open_bus(n):
+    fd = os.open(f"/dev/i2c-{n}", os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, I2C_SLAVE, ADDR)  # fails with EBUSY if a kernel driver owns it
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def sample(fd):
+    raw = [read_byte(fd, REG + i) for i in range(NPINS * 4)]
+    pins = []
+    for i in range(NPINS):
+        o = i * 4
+        mv = raw[o] << 8 | raw[o + 1]
+        ma = raw[o + 2] << 8 | raw[o + 3]
+        pins.append((NPINS - 1 - i, mv / 1000, ma / 1000))
+    return sorted(pins)
+
+
+def plausible(pins):
+    return any(10.5 <= v <= 13.5 for _, v, _ in pins) and all(a <= 25 for *_, a in pins)
+
+
+def find_bus(preferred):
+    for n in ([preferred] if preferred is not None else nvidia_buses()):
+        try:
+            fd = open_bus(n)
+        except OSError:
+            continue
+        try:
+            if plausible(sample(fd)):
+                return n, fd
+        except OSError:
+            pass
+        os.close(fd)
+    return None, None
+
+
+def render(pins, bus):
+    tot_a = sum(a for *_, a in pins)
+    tot_w = sum(v * a for _, v, a in pins)
+    lines = [f"ROG Astral 12V-2x6  (i2c-{bus}, 0x{ADDR:02X})   {time.strftime('%H:%M:%S')}", ""]
+    lines.append(" Pin    Volts    Amps    Watts")
+    for p, v, a in pins:
+        flag = "  !! OVER" if a >= LIMIT_A else ("  ! high" if a >= WARN_A else "")
+        bar = "#" * min(40, int(a / LIMIT_A * 30))
+        lines.append(f"  {p}   {v:6.3f}  {a:6.2f}  {v*a:7.1f}  {bar}{flag}")
+    amps = [a for *_, a in pins]
+    spread = (max(amps) - min(amps)) if amps else 0
+    lines += ["", f" Total {tot_a:6.2f} A  {tot_w:7.1f} W   max-min spread {spread:.2f} A"]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- watchdog --
+SUSTAIN = 3            # consecutive bad samples before alerting
+SPREAD_A = 3.0         # max-min pin current spread considered abnormal ...
+SPREAD_MIN_TOTAL_A = 15.0  # ... but only when the card is actually loaded
+VSAG_V = 11.4          # per-pin voltage below this under load = bad contact
+VSAG_MIN_TOTAL_A = 10.0
+REALERT_S = 300        # after a dismissed alert, stay quiet this long (same level)
+AUTO_SHUTDOWN_S = 30   # unanswered CRITICAL dialog -> power off if still critical
+
+
+def assess(pins):
+    """Return (level, reasons). level: 0 ok, 1 warning, 2 critical."""
+    amps = [a for *_, a in pins]
+    total = sum(amps)
+    level, why = 0, []
+    for p, v, a in pins:
+        if a >= LIMIT_A:
+            level = 2; why.append(f"pin {p} at {a:.2f} A (limit {LIMIT_A} A)")
+        elif a >= WARN_A:
+            level = max(level, 1); why.append(f"pin {p} at {a:.2f} A (warn {WARN_A} A)")
+        if total >= VSAG_MIN_TOTAL_A and v < VSAG_V:
+            level = max(level, 1); why.append(f"pin {p} voltage sagging to {v:.2f} V")
+    spread = max(amps) - min(amps)
+    if total >= SPREAD_MIN_TOTAL_A and spread >= SPREAD_A:
+        level = max(level, 1)
+        why.append(f"uneven load: {spread:.2f} A between highest and lowest pin")
+    return level, why
+
+
+def table(pins):
+    return "\n".join(f"Pin {p}:  {v:6.3f} V   {a:5.2f} A" for p, v, a in pins)
+
+
+def show_dialog(level, why, tables):
+    title = ("GPU power connector CRITICAL" if level == 2 else
+             "GPU power connector warning")
+    msg = ("Abnormal current on the 12V-2x6 GPU power connector:\n\n• " +
+           "\n• ".join(why) + "\n\n" + tables +
+           "\n\nThis can mean a loose or damaged cable and may overheat the connector."
+           "\nShut down the PC now?" +
+           (f"\n\nIf you don't answer, the PC shuts down automatically in "
+            f"{AUTO_SHUTDOWN_S} seconds while the problem persists." if level == 2 else ""))
+    cmd = ["kdialog", "--title", title, "--warningyesno", msg,
+           "--yes-label", "Shut down now", "--no-label", "Ignore"]
+    subprocess.run(["notify-send", "-u", "critical", "-a", "astral-pins", title,
+                    "; ".join(why)], check=False)
+    return subprocess.Popen(cmd)
+
+
+def watch(args):
+    test = args.test_alert
+    bus = fd = None
+    astral_next_try = 0.0
+    wv = None if test else WireViewPoller()
+    bad = 0
+    dialog = dialog_level = None
+    quiet_until = {1: 0.0, 2: 0.0}
+    fail_since = None
+    lost_notified = False
+    last_log = (0, 0.0)
+    print(f"astral-pins watchdog started (warn {WARN_A} A, limit {LIMIT_A} A, "
+          f"spread {SPREAD_A} A, sag {VSAG_V} V)", flush=True)
+    while True:
+        # handle a finished dialog
+        if dialog is not None and dialog.poll() is not None:
+            if dialog.returncode == 0:
+                print("user chose SHUT DOWN", flush=True)
+                subprocess.run(["systemctl", "poweroff"] + (["--dry-run"] if test else []))
+                if test:
+                    print("(test mode: dry-run only)", flush=True); return
+            else:
+                print(f"user ignored level-{dialog_level} alert", flush=True)
+                quiet_until[dialog_level] = time.time() + REALERT_S
+                if dialog_level == 2:
+                    quiet_until[1] = quiet_until[2]
+                if test:
+                    return
+            dialog = None
+
+        # --- source 1: ROG Astral onboard sensor (I2C) ---
+        apins = None
+        if test:
+            apins = [(0, 12.1, 2.1), (1, 12.1, 9.8), (2, 12.1, 2.0),
+                     (3, 12.1, 9.7), (4, 12.1, 1.9), (5, 12.1, 2.2)]
+        elif fd is not None or time.monotonic() >= astral_next_try:
+            if fd is None:
+                bus, fd = find_bus(args.bus)
+            try:
+                if fd is None:
+                    raise OSError("sensor not found")
+                apins = sample(fd)
+                if not plausible(apins):
+                    raise OSError(f"implausible data {apins}")
+                fail_since, lost_notified = None, False
+            except OSError as e:
+                apins = None
+                if fd is not None:
+                    os.close(fd); fd = None
+                astral_next_try = time.monotonic() + 5
+                fail_since = fail_since or time.time()
+                write_state(error=str(e))
+                if time.time() - fail_since > 30 and not lost_notified:
+                    print(f"sensor unavailable: {e}", flush=True)
+                    subprocess.run(["notify-send", "-a", "astral-pins",
+                                    "GPU pin monitor", "Can't read the ROG Astral 12V-2x6 "
+                                    "sensor; its per-pin protection is paused."], check=False)
+                    lost_notified = True
+
+        # --- source 2: WireView Pro II (USB serial, optional) ---
+        wvd = wv.poll() if wv else None
+
+        # --- assess both ---
+        level, why, tables = 0, [], []
+        a_level = w_level = 0
+        if apins:
+            a_level, a_why = assess(apins)
+            why += [f"GPU sensor: {w}" for w in a_why]
+            tables.append("ROG Astral (GPU side)\n" + table(apins))
+        if wvd:
+            w_level, w_why = assess(wvd["pins"])
+            if wvd["faults"]:
+                w_level = max(w_level, 1)
+                w_why += [f"device fault: {f}" for f in wvd["faults"]]
+            why += [f"WireView: {w}" for w in w_why]
+            tables.append("WireView Pro II (inline)\n" + table(wvd["pins"]))
+        level = max(a_level, w_level)
+        bad = bad + 1 if level else 0
+        sustained = bad >= SUSTAIN
+
+        if not test:
+            if apins:
+                write_state(bus=bus, pins=apins, level=a_level if sustained else 0,
+                            why=why, warn_a=WARN_A, limit_a=LIMIT_A)
+            if wvd:
+                write_state(WV_STATE_FILE, **wvd, level=w_level if sustained else 0,
+                            warn_a=WARN_A, limit_a=LIMIT_A)
+            elif wv and wv.dev is None:
+                write_state(WV_STATE_FILE, error=wv.err)
+
+        if not level:
+            last_log = (0, 0.0)
+        if level and sustained and (level != last_log[0] or time.time() - last_log[1] >= 30):
+            last_log = (level, time.time())
+            print(f"level {level}: {'; '.join(why)}", flush=True)
+        if level and sustained:
+            escalate = dialog is not None and level > dialog_level
+            if escalate:
+                dialog.terminate(); dialog = None
+            if dialog is None and time.time() >= quiet_until[level]:
+                dialog, dialog_level = show_dialog(level, why, "\n\n".join(tables)), level
+                dialog_opened = time.time()
+
+        # unanswered critical dialog: power off if the problem is still there
+        if (dialog is not None and dialog_level == 2 and level == 2
+                and time.time() - dialog_opened >= AUTO_SHUTDOWN_S):
+            dialog.terminate(); dialog = None
+            print(f"no answer within {AUTO_SHUTDOWN_S}s and still critical: AUTO SHUTDOWN",
+                  flush=True)
+            subprocess.run(["notify-send", "-u", "critical", "-a", "astral-pins",
+                            "GPU power connector CRITICAL", "Shutting down now."], check=False)
+            subprocess.run(["systemctl", "poweroff"] + (["--dry-run"] if test else []))
+            if test:
+                print("(test mode: dry-run only)", flush=True)
+            return
+        time.sleep(args.interval)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--version", action="version", version=f"astral-pins {__version__}")
+    ap.add_argument("--bus", type=int, help="force /dev/i2c-N")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--watch", action="store_true",
+                    help="run as a watchdog: pop up a dialog on abnormal readings")
+    ap.add_argument("--test-alert", action="store_true",
+                    help="show the alert with fake data; 'Shut down' only does a dry run")
+    ap.add_argument("--wv-screen", choices=list(WV_SCREENS),
+                    help="ask the running watchdog to switch the WireView display")
+    args = ap.parse_args()
+
+    if args.wv_screen:
+        write_state(WV_CMD_FILE, screen=args.wv_screen)
+        print(f"requested WireView screen '{args.wv_screen}'")
+        return
+
+    if args.watch or args.test_alert:
+        try:
+            watch(args)
+        except KeyboardInterrupt:
+            pass
+        return
+
+    bus, fd = find_bus(args.bus)
+    if fd is None:
+        sys.exit("No Astral pin sensor found at 0x2B on NVIDIA I2C buses "
+                 f"({nvidia_buses()}). Need rw access to /dev/i2c-* and the i2c-dev module.")
+    try:
+        while True:
+            out = render(sample(fd), bus)
+            if args.once:
+                print(out)
+                return
+            print("\033[H\033[J" + out, flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()
